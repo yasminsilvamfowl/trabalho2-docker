@@ -1,0 +1,139 @@
+# Cinematix — Trabalho 2 (Docker + Docker Compose)
+# Sobe tudo com:  docker compose up -d --build
+name: cinematix
+
+x-aws: &aws
+  # DynamoDB continua na AWS: credenciais vêm do arquivo .env da raiz.
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?defina no .env}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?defina no .env}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  DYNAMO_TABLE: ${DYNAMO_TABLE:-dspn-projeto-dynamo-logs}
+
+x-minio: &minio
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+  S3_BUCKET: ${S3_BUCKET:-cinematix}
+
+x-rabbit: &rabbit
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-cinematix}:${RABBITMQ_PASSWORD:-cinematix}@rabbitmq:5672/
+  RABBITMQ_QUEUE: cinematix-tarefas
+
+services:
+  # ---------- infraestrutura ----------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ingressos
+      POSTGRES_USER: ${POSTGRES_USER:-cinematix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cinematix}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [interna]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d ingressos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [interna]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # Imagem do MinIO gerada do código-fonte oficial (minio/minio saiu do Docker Hub).
+    build: ./minio
+    image: cinematix-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9001:9001" # console web do MinIO
+    networks: [interna]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-cinematix}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-cinematix}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672" # painel de gerenciamento do RabbitMQ
+    networks: [interna]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------- aplicação ----------
+  backend:
+    build: ./backend
+    image: cinematix-backend
+    restart: unless-stopped
+    environment:
+      <<: [*aws, *minio, *rabbit]
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cinematix}:${POSTGRES_PASSWORD:-cinematix}@postgres:5432/ingressos
+      REDIS_URL: redis://redis:6379
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?defina no .env}
+      FILES_PUBLIC_URL: /api/arquivos/
+      SEED_ON_START: "true"
+    ports:
+      - "8000:8000" # acesso direto à API (docs em /docs)
+    networks: [interna, publica]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  worker:
+    build: ./worker
+    image: cinematix-worker
+    restart: unless-stopped
+    environment:
+      <<: [*aws, *minio, *rabbit]
+    networks: [interna]
+    depends_on:
+      minio: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  frontend:
+    build: ./frontend
+    image: cinematix-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    networks: [publica]
+    depends_on:
+      backend: { condition: service_healthy }
+
+# "publica": frontend <-> backend. "interna": backend/worker <-> bancos, fila e arquivos.
+# O frontend não enxerga Postgres, Redis, MinIO nem RabbitMQ.
+networks:
+  publica:
+  interna:
+
+volumes:
+  postgres-data:
+  minio-data:
+  rabbitmq-data:
