@@ -1,2 +1,446 @@
 # trabalho2-docker
 Repositório do Trabalho 2 de Nuvem
+
+# dev-nuvem
+Desenvolvimento de Software para Nuvem
+
+# 🐳 Trabalho 2 — Cinematix com Docker e Docker Compose
+
+Nesta versão toda a aplicação sobe com **um único comando** (`docker compose up`). Os serviços gerenciados da AWS do Trabalho 1 foram trocados por containers, exceto o banco NoSQL, que continua na AWS:
+
+| Trabalho 1 (AWS) | Trabalho 2 (Docker) | Container / imagem |
+|---|---|---|
+| Amazon RDS (PostgreSQL) | PostgreSQL gerenciado pela equipe | `postgres:16-alpine` |
+| Amazon S3 | MinIO (API compatível com S3) | `minio/Dockerfile` (código oficial do MinIO) |
+| Amazon SNS + SQS | RabbitMQ (fila `cinematix-tarefas`) | `rabbitmq:3.13-management-alpine` |
+| Amazon ElastiCache (Redis) | Redis | `redis:7-alpine` |
+| **Amazon DynamoDB** | **continua na AWS** (logs de auditoria) | — |
+| EC2 + Nginx (API) | Backend FastAPI | `backend/Dockerfile` |
+| EC2 (worker SQS) | Worker que consome o RabbitMQ | `worker/Dockerfile` |
+| S3 Static Website | Frontend React servido por Nginx | `frontend/Dockerfile` (multi-stage) |
+
+## Arquitetura dos containers
+
+```mermaid
+flowchart LR
+    U[Navegador] -->|":8080"| FE
+
+    subgraph publica["rede publica"]
+        FE["frontend<br/>Nginx + React<br/>/api → backend"]
+    end
+
+    subgraph interna["rede interna"]
+        BE["backend<br/>FastAPI"]
+        WK["worker<br/>thumbnails e PDFs"]
+        PG[("postgres")]
+        RD[("redis")]
+        MN[("minio")]
+        MQ{{"rabbitmq"}}
+    end
+
+    FE --> BE
+    BE --> PG
+    BE --> RD
+    BE -->|"upload / download"| MN
+    BE -->|"publica tarefa"| MQ
+    MQ -->|"consome"| WK
+    WK --> MN
+    BE -.-> DDB[("Amazon DynamoDB<br/>(AWS)")]
+    WK -.-> DDB
+```
+
+* **Redes:** `publica` liga só o frontend ao backend; `interna` liga backend e worker aos bancos, à fila e ao MinIO. O frontend não tem acesso aos serviços de dados.
+* **Dependências:** `depends_on` com `condition: service_healthy`. Postgres, Redis, MinIO e RabbitMQ têm *healthcheck*; o backend só sobe quando todos estão saudáveis, e o frontend só sobe quando o backend responde em `/health`.
+* **Volumes:** `postgres-data`, `minio-data` e `rabbitmq-data` mantêm os dados entre reinícios.
+
+## Fluxo de mensagens (RabbitMQ)
+
+1. **Upload de pôster** (admin): o backend grava o original no MinIO (`posters/…`) e publica `{"action": "thumbnail"}` na fila.
+2. **Compra de ingresso:** o backend grava a venda no Postgres e publica `{"action": "generate_pdf"}`.
+3. O **worker** consome a fila, gera o thumbnail ou o PDF, grava no MinIO (`thumbs/…`, `ingressos/pdf/…`), registra no DynamoDB e confirma a mensagem (`ack`). Se der erro, a mensagem volta para a fila uma vez.
+4. O frontend mostra os pôsteres por `/api/arquivos/...` e baixa o PDF por `/api/ingressos/pdf?...` (link assinado). Os dois são lidos do MinIO pelo backend.
+
+## ▶️ Como executar
+
+**Pré-requisitos:** Docker com o plugin Compose (Docker Desktop ou Docker Engine 24+), Git e credenciais da AWS com acesso à tabela DynamoDB `dspn-projeto-dynamo-logs` (chave de partição `id`, tipo String).
+
+1. Baixe o código:
+
+```bash
+git clone https://github.com/matheussdc/dev-nuvem.git
+```
+
+```bash
+cd dev-nuvem
+```
+
+2. Crie o arquivo de configuração e preencha as credenciais da AWS e o `ADMIN_TOKEN`:
+
+```bash
+cp .env.example .env
+```
+
+> No AWS Academy, os valores de `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN` estão em *AWS Details → AWS CLI*. Eles expiram ao fim de cada sessão do lab: atualize o `.env` e rode `docker compose up -d` de novo.
+
+3. Gere as imagens e suba todos os serviços:
+
+```bash
+docker compose up -d --build
+```
+
+A primeira build demora alguns minutos porque a imagem do MinIO é compilada a partir do código-fonte oficial (a MinIO não publica mais a imagem `minio/minio` no Docker Hub). Depois disso ela fica em cache.
+
+Na primeira subida o backend cria as tabelas, cria o bucket no MinIO e popula o catálogo com os filmes de `backend/seed/` (os pôsteres passam pela fila e o worker gera os thumbnails).
+
+4. Acompanhe:
+
+```bash
+docker compose ps
+```
+
+```bash
+docker compose logs -f backend worker
+```
+
+| Serviço | Endereço |
+|---|---|
+| Aplicação (bilheteria) | http://localhost:8080 |
+| Painel admin | http://localhost:8080/#/admin (senha = `ADMIN_TOKEN`) |
+| API / Swagger | http://localhost:8000/docs |
+| Console do MinIO | http://localhost:9001 (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`) |
+| Painel do RabbitMQ | http://localhost:15672 (`RABBITMQ_USER` / `RABBITMQ_PASSWORD`) |
+
+5. Para parar (`-v` também apaga os volumes, ou seja, banco, arquivos e fila):
+
+```bash
+docker compose down
+```
+
+### Testar sem credenciais da AWS (opcional)
+
+Para desenvolvimento, dá para trocar o DynamoDB da AWS pelo **DynamoDB Local** com um arquivo extra. Na apresentação use só o `docker-compose.yml`. No `.env`, coloque qualquer valor em `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY` e rode:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dynamo-local.yml up -d --build
+```
+
+## ✅ Roteiro de demonstração (evidências)
+
+| O que mostrar | Como |
+|---|---|
+| Todos os containers rodando | `docker compose ps` (todos `healthy` / `running`) |
+| Postgres persistindo | comprar um ingresso e rodar `docker compose exec postgres psql -U cinematix -d ingressos -c "select * from ingressos;"` |
+| MinIO: upload/download | cadastrar um filme com pôster no admin → arquivo aparece no console do MinIO (bucket `cinematix`) → pôster aparece na bilheteria; baixar o PDF do ingresso |
+| RabbitMQ: produção/consumo | painel do RabbitMQ (fila `cinematix-tarefas`, gráfico de mensagens) + `docker compose logs worker` mostrando `✓ thumbnail …` e `✓ pdf …` |
+| DynamoDB: escrita/consulta | aba **Logs** no admin (lê da tabela) ou console da AWS |
+
+<!-- Coloque aqui os prints: docs/prints/compose-ps.png, minio.png, rabbitmq.png, compra.png, logs-dynamo.png -->
+
+---
+
+# ☁️ Trabalho 1 — versão na AWS (referência)
+
+> As seções abaixo descrevem a implantação original do Trabalho 1 em serviços gerenciados da AWS. O código atual usa MinIO e RabbitMQ; as variáveis de ambiente válidas são as do `.env.example` da raiz.
+
+# 🎬 Cinematix — Sistema Cloud-Native de Reserva de Ingressos de Cinema
+
+O **Cinematix** é uma plataforma full-stack cloud-native desenvolvida para a reserva e venda de ingressos de cinema em tempo real. Projetado para operar com alta disponibilidade, resiliência e escalabilidade automática na **AWS**, o sistema adota uma arquitetura orientada a eventos e desacoplada em microsserviços/workers:
+
+* **Backend & API Web**: Servidor FastAPI rodando em instâncias EC2 sob um **Auto Scaling Group**, com **Nginx** atuando como proxy reverso e balanceado por um **Application Load Balancer (ALB)**.
+* **Gerenciamento de Concorrência & Cache**: **Amazon ElastiCache (Redis)** para aceleração na leitura do catálogo e controle de **locks temporários de assentos** (TTL de 5 min) por cliente.
+* **Persistência Relacional**: **Amazon RDS (PostgreSQL)** mantido em subnet privada para garantir a integridade relacional de filmes, sessões e ingressos vendidos.
+* **Processamento Assíncrono de Mídia**: O upload de pôsteres publica mensagens no **Amazon SNS**, repassadas para uma fila **Amazon SQS**. Um **Worker (EC2)** dedicado consome essa fila, gera os thumbnails das capas e grava os arquivos no **Amazon S3**.
+* **Auditoria Centralizada**: Trilha de auditoria unificada de todas as ações da API e do Worker gravada no **Amazon DynamoDB**.
+* **Hospedagem Frontend**: Aplicação em React 19 com TypeScript, distribuída como site estático no **Amazon S3 Static Website Hosting**.
+
+---
+
+## 📐 Arquitetura da Infraestrutura (AWS)
+
+A infraestrutura foi implementada dentro de uma **Amazon VPC**, segregando a camada pública de entrada do ambiente privado de armazenamento:
+
+
+```mermaid
+
+flowchart TD
+    U[Espectador / Administrador]
+
+    subgraph AWS["AWS Cloud"]
+        subgraph VPC["Amazon VPC"]
+            S3F["Amazon S3<br/>Frontend estático"]
+            ALB["Application Load Balancer"]
+
+            subgraph PUB["Sub-rede pública"]
+                ASG["Auto Scaling Group"]
+                EC2["EC2: Nginx + Uvicorn + FastAPI"]
+            end
+
+            subgraph PRIV["Sub-rede privada"]
+                RDS[("Amazon RDS<br/>PostgreSQL")]
+                REDIS[("Amazon ElastiCache<br/>Redis")]
+            end
+
+            SNS["Amazon SNS"]
+            SQS["Amazon SQS"]
+            WORKER["Worker EC2"]
+            S3A["Amazon S3<br/>Pôsteres, thumbnails e PDFs"]
+            DDB[("Amazon DynamoDB<br/>Auditoria")]
+        end
+    end
+
+    U -->|"HTTPS: carrega o site"| S3F
+    U -->|"HTTP(S): chamadas da API"| ALB
+    ALB --> ASG
+    ASG --> EC2
+
+    EC2 --> RDS
+    EC2 --> REDIS
+    EC2 -->|"Publica eventos de upload"| SNS
+    SNS -->|"Assinatura do tópico"| SQS
+    SQS --> WORKER
+    WORKER --> S3A
+    EC2 -.->|"Registros de auditoria"| DDB
+    WORKER -.->|"Registros de processamento"| DDB
+
+    classDef frontend fill:#e8f5e9,stroke:#388e3c,color:#1b5e20
+    classDef network fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
+    classDef compute fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef storage fill:#ede7f6,stroke:#673ab7,color:#311b92
+    classDef messaging fill:#fce4ec,stroke:#c2185b,color:#880e4f
+
+    class S3F,S3A frontend
+    class ALB network
+    class ASG,EC2,WORKER compute
+    class RDS,REDIS,DDB storage
+    class SNS,SQS messaging
+```
+
+
+### Componentes AWS
+
+* **Amazon VPC**: Isolamento lógico de rede dividido em Subnets Públicas e Subnets Privadas.
+* **Amazon S3**: Buckets dedicados para hospedagem estática do Frontend e armazenamento de assets (pôsteres originais, thumbnails e arquivos PDF dos ingressos).
+* **Application Load Balancer (ALB)**: Distribui as requisições HTTP recebidas entre as instâncias EC2 da aplicação web.
+* **Auto Scaling Group (EC2)**: Gerencia o escalamento horizontal do Backend conforme o uso de vCPU das instâncias.
+* **Nginx**: Proxy reverso rodando na porta 80 das EC2s direcionando as requisições para o Uvicorn na porta 8000, oferecendo a rota `/health` para os Health Checks do ALB.
+* **Amazon ElastiCache (Redis)**: Cache do catálogo e sistema de reservas com TTL de 5 minutos, evitando conflitos simultâneos de assentos.
+* **Amazon RDS (PostgreSQL)**: Banco de dados relacional em subnet privada contendo tabelas de filmes, sessões e ingressos com trava de integridade contra vendas duplicadas.
+* **Amazon SNS & SQS**: Desacoplamento assíncrono para eventos de imagem via Publish/Subscribe (SNS) e fila de mensagens (SQS).
+* **Worker EC2**: Processo continuo escutando o SQS, gerando thumbnails com Pillow e atualizando o S3 e DynamoDB.
+* **Amazon DynamoDB**: Tabela NoSQL usada para persistir o histórico de logs de auditoria de todas as entidades (`CREATE`, `READ`, `UPDATE`, `DELETE`, `PROCESS`).
+
+---
+
+## ✨ Funcionalidades do Sistema
+
+### 🎟️ Para o Espectador (Bilheteria Web)
+* **Navegação no Catálogo**: Consulta otimizada servida via cache Redis.
+* **Mapa Interativo da Sala**: Seleção visual de lugares organizados das fileiras **A até G** com 16 lugares por fileira (112 assentos por sessão).
+* **Bloqueio Concorrente de Lugares**: Trava temporária no Redis vinculada ao `client_id` do navegador, válida por 5 minutos.
+* **Ingresso em PDF Assinado**: Emissão do bilhete contendo canhoto e dados da compra, com download seguro validado por assinatura HMAC SHA256.
+
+### 🔄 Worker Assíncrono de Imagens
+* **Redimensionamento Automático**: Consumo da fila SQS para geração de thumbnails (`300x450px`, JPEG quality 85) dos novos pôsteres enviados.
+* **Métricas de Processamento**: Gravação automatizada de logs no DynamoDB com dimensões de conversão (`de` -> `para`).
+
+### 🛠️ Para a Administração (`#/admin`)
+* **Gestão do Catálogo (CRUD de Filmes)**: Cadastro e edição de títulos com envio de imagem de capa para o S3.
+* **Agendamento de Sessões**: Criação de horários, datas e preços diferenciados para os filmes exibidos.
+* **Relatório de Compras**: Consulta consolidada de ingressos vendidos e identificação dos compradores.
+* **Visualizador de Auditoria**: Leitura dos logs de operações em tempo real via DynamoDB.
+* **Simulador de Stress de CPU**: Ferramenta no painel administrativo para elevar a carga da CPU da instância a 100%, permitindo validar os alarmes do CloudWatch e o Auto Scaling.
+
+---
+
+## 🧰 Tech Stack
+
+### Backend & Worker
+* **Linguagem**: Python 3.10+
+* **Framework Web**: FastAPI + Uvicorn
+* **ORM & Banco**: SQLAlchemy 2.0, Psycopg 3 (PostgreSQL)
+* **Cache & Locks**: Redis-py
+* **AWS SDK**: Boto3 (S3, SNS, SQS, DynamoDB)
+* **Geração de Mídias & PDF**: Pillow (PIL)
+* **Proxy & Servidor**: Nginx + Systemd
+
+### Frontend
+* **Biblioteca**: React 19 (`react`, `react-dom`)
+* **Linguagem**: TypeScript 7 (`typescript`)
+* **Build Engine**: Vite 8 (`vite`, `rolldown`, `lightningcss`)
+* **Roteamento**: Router por Hash nativo (`#/` e `#/admin`)
+* **Estilização**: CSS3 com variáveis globais (Dark Theme)
+
+---
+
+## 📁 Estrutura do Repositório
+
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── config.py             # Validação do .env com Pydantic Settings
+│   │   ├── database.py           # Schemas SQLAlchemy (Filme, Sessao, Ingresso)
+│   │   ├── main.py               # API REST FastAPI e lógica AWS/Redis
+│   │   ├── pdf.py                # Gerador de PDF via Pillow
+│   │   └── seed.py               # Population script para banco e S3
+│   ├── seed/
+│   │   ├── filmes.json           # Massa de dados de exemplo
+│   │   └── posters/              # Arquivos de imagem dos pôsteres
+│   ├── .env.example              # Modelo de variáveis de ambiente
+│   ├── requirements.txt          # Dependências Python do Backend
+│   └── test_app.py               # Testes de fumaça e integração
+│
+├── worker/
+│   ├── requirements.txt          # Dependências Python do Worker
+│   └── worker.py                 # Worker SQS de geração de thumbnails
+│
+├── frontend/
+│   ├── src/
+│   │   ├── Admin.tsx             # Interface do Painel Administrativo (#/admin)
+│   │   ├── App.tsx               # Interface da bilheteria e mapa de assentos
+│   │   ├── api.ts                # Cliente HTTP com autenticação Admin
+│   │   ├── main.tsx              # Ponto de entrada do React
+│   │   └── styles.css            # Folha de estilos globais
+│   ├── index.html
+│   ├── package.json              # Scripts e dependências Frontend
+│   ├── package-lock.json         # Versões travadas das dependências Node
+│   └── tsconfig.json             # Configurações do TypeScript
+│
+├── launch templates/
+│   ├── backend.sh                # UserData script para EC2 Backend (Nginx + FastAPI)
+│   └── worker.sh                 # UserData script para EC2 Worker (SQS)
+│
+└── scripts/
+    ├── deploy-backend.sh         # Script de atualização da API via SSH
+    └── deploy-frontend.sh        # Script de build e sync do Frontend no S3
+```
+## 🔑 Variáveis de Ambiente (.env)
+
+### Backend (backend/.env)
+
+DATABASE_URL=postgresql+psycopg://postgres:SUA_SENHA@ENDPOINT-RDS.rds.amazonaws.com:5432/ingressos
+REDIS_URL=redis://ENDPOINT-REDIS.cache.amazonaws.com:6379
+S3_BUCKET=seu-bucket-s3
+SNS_TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:dspn-projeto-sns
+DYNAMO_TABLE=dspn-projeto-dynamo-logs
+ADMIN_TOKEN=senha_segura_admin
+AWS_REGION=us-east-1
+
+### Worker (worker/.env)
+
+S3_BUCKET=seu-bucket-s3
+SQS_URL=[https://sqs.us-east-1.amazonaws.com/123456789012/dspn-projeto-queue](https://sqs.us-east-1.amazonaws.com/123456789012/dspn-projeto-queue)
+DYNAMO_TABLE=dspn-projeto-dynamo-logs
+AWS_REGION=us-east-1
+
+
+--
+
+# 🚀 Guia de Implantação e Execução
+## 1. Provisionamento Automático na AWS (Launch Templates)
+Os scripts na pasta launch templates/ são executados no UserData das instâncias EC2:
+
+Backend (launch templates/backend.sh):
+
+* Atualiza o SO Debian/Ubuntu e instala python3-pip, python3-venv, nginx, git, awscli e fonts-dejavu-core.
+
+* Clona o repositório em /opt/app, cria o ambiente virtual e instala requirements.txt.
+
+* Configura o serviço no systemd (backend.service).
+
+* Ajusta o Nginx na porta 80 como reverse proxy para o Uvicorn na porta 8000, deixando ativa a rota /health para o Load Balancer.
+
+Worker (launch templates/worker.sh):
+
+* Clona o código em /opt/worker, cria o ambiente virtual e instala as dependências.
+
+* Cria e ativa o serviço worker.service no systemd para escutar a fila SQS continuamente.
+  
+## 2. Automação de Deploys (scripts/)
+* Deploy do Frontend para o S3:
+  
+  `./scripts/deploy-frontend.sh <DNS-DO-ALB> <NOME-DO-BUCKET-FRONTEND>`
+
+Injeta a URL do ALB na variável VITE_API_URL, compila os arquivos do React e sincroniza com o bucket S3.
+
+* Deploy do Backend na EC2:
+  
+  `./scripts/deploy-backend.sh <IP_DA_EC2>`
+  
+Conecta via SSH na instância, executa git pull, atualiza dependências do Python e reinicia o serviço no systemd.
+
+## 3. Execução Local para Desenvolvimento 
+
+#### Backend (FastAPI)
+
+1. Acesse o diretório do backend e crie o ambiente virtual:
+  ```bash
+  cd backend
+  python -m venv venv
+  source venv/bin/activate  # Windows: venv\Scripts\activate
+```
+2. Instale as dependências:
+  ```bash
+   pip install -r requirements.txt
+```
+3. Instale o pacote de fontes para geração de PDFs (Linux):
+  ```bash
+  sudo apt-get install -y fonts-dejavu-core
+```
+4. Popule o banco e o bucket S3 (opcional):
+  ```bash
+  python -m app.seed
+```
+5. Inicie a API:
+  ```bash
+  uvicorn app.main:app --reload --port 8000
+```
+
+#### Worker (Redimensionador de Imagens)
+
+1. Em um novo terminal, acesse a pasta do worker:
+  ```bash
+  cd worker
+  pip install -r requirements.txt
+```
+
+2. Inicie o worker:
+  ```bash
+   python worker.py
+```
+#### Frontend (React + TypeScript)
+
+1. Acesse a pasta do frontend e instale as dependências Node:
+  ```bash
+   cd frontend
+   npm install
+```
+2. Inicie o servidor local:
+  ```bash
+   npm run dev
+```
+3. Rotas de acesso:
+   
+  **Bilheteria Pública**: `http://localhost:5173/`
+   
+  **Painel Administrativo**: `http://localhost:5173/#/admin`
+
+# 🧪 Testes e Validações
+## Teste de Fumaça (Smoke Test)
+
+* Para validar o fluxo de ponta a ponta usando instâncias locais do PostgreSQL e Redis (com mocks automatizados das chamadas da AWS):
+
+
+```bash
+ cd backend
+ DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/postgres \
+ REDIS_URL=redis://localhost:6379 \
+ python test_app.py
+```
+
+## Validação do Auto Scaling
+
+1. Acesse o painel admin em `/#/admin`.
+2. Clique na aba **"Stress de CPU"**.
+3. Defina a duração (ex: 180 segundos) e clique em **"Gerar carga"**.
+4. O backend ocupará 100% de uso de vCPU, permitindo acompanhar o aumento do tráfego nos alarmes do CloudWatch e o acionamento de novas instâncias EC2 pelo Auto Scaling Group.
