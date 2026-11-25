@@ -1,0 +1,19 @@
+# Opcional, só para testar SEM credenciais AWS: troca o DynamoDB da AWS pelo DynamoDB Local.
+#   docker compose -f docker-compose.yml -f docker-compose.dynamo-local.yml up -d --build
+# Na entrega/apresentação use apenas o docker-compose.yml (DynamoDB real na AWS).
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.4
+    networks: [interna]
+
+  backend:
+    environment:
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+    depends_on:
+      dynamodb: { condition: service_started }
+
+  worker:
+    environment:
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+    depends_on:
+      dynamodb: { condition: service_started }
