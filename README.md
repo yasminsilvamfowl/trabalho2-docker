@@ -1,9 +1,3 @@
-# trabalho2-docker
-Repositório do Trabalho 2 de Nuvem
-
-# dev-nuvem
-Desenvolvimento de Software para Nuvem
-
 # 🐳 Trabalho 2 — Cinematix com Docker e Docker Compose
 
 Nesta versão toda a aplicação sobe com **um único comando** (`docker compose up`). Os serviços gerenciados da AWS do Trabalho 1 foram trocados por containers, exceto o banco NoSQL, que continua na AWS:
@@ -62,25 +56,33 @@ flowchart LR
 
 ## ▶️ Como executar
 
-**Pré-requisitos:** Docker com o plugin Compose (Docker Desktop ou Docker Engine 24+), Git e credenciais da AWS com acesso à tabela DynamoDB `dspn-projeto-dynamo-logs` (chave de partição `id`, tipo String).
+**Pré-requisitos:** Docker com o plugin Compose (Docker Desktop ou Docker Engine 24+), Git e uma conta AWS com acesso à tabela DynamoDB `dspn-projeto-dynamo-logs` (chave de partição `id`, tipo String).
+
+Se o Docker ainda não estiver instalado (Ubuntu):
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER
+```
+
+Saia e entre de novo na sessão para o grupo `docker` valer.
 
 1. Baixe o código:
 
 ```bash
-git clone https://github.com/matheussdc/dev-nuvem.git
+git clone https://github.com/yasminsilvamfowl/trabalho2-docker.git
 ```
 
 ```bash
-cd dev-nuvem
+cd trabalho2-docker
 ```
 
-2. Crie o arquivo de configuração e preencha as credenciais da AWS e o `ADMIN_TOKEN`:
+2. Crie o arquivo de configuração e edite o `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-> No AWS Academy, os valores de `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN` estão em *AWS Details → AWS CLI*. Eles expiram ao fim de cada sessão do lab: atualize o `.env` e rode `docker compose up -d` de novo.
+> Preencha `ADMIN_TOKEN` (senha do painel admin) e, se a máquina não tiver permissão de acesso ao DynamoDB por perfil de instância, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN`.
 
 3. Gere as imagens e suba todos os serviços:
 
@@ -102,13 +104,15 @@ docker compose ps
 docker compose logs -f backend worker
 ```
 
+Use `localhost` no lugar de `<IP-DA-MAQUINA>` se estiver rodando na própria máquina.
+
 | Serviço | Endereço |
 |---|---|
-| Aplicação (bilheteria) | http://localhost:8080 |
-| Painel admin | http://localhost:8080/#/admin (senha = `ADMIN_TOKEN`) |
-| API / Swagger | http://localhost:8000/docs |
-| Console do MinIO | http://localhost:9001 (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`) |
-| Painel do RabbitMQ | http://localhost:15672 (`RABBITMQ_USER` / `RABBITMQ_PASSWORD`) |
+| Aplicação (bilheteria) | http://<IP-DA-MAQUINA>:8080 |
+| Painel admin | http://<IP-DA-MAQUINA>:8080/#/admin (senha = `ADMIN_TOKEN`) |
+| API / Swagger | http://<IP-DA-MAQUINA>:8000/docs |
+| Console do MinIO | http://<IP-DA-MAQUINA>:9001 (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`) |
+| Painel do RabbitMQ | http://<IP-DA-MAQUINA>:15672 (`RABBITMQ_USER` / `RABBITMQ_PASSWORD`) |
 
 5. Para parar (`-v` também apaga os volumes, ou seja, banco, arquivos e fila):
 
@@ -116,25 +120,53 @@ docker compose logs -f backend worker
 docker compose down
 ```
 
-### Testar sem credenciais da AWS (opcional)
+## ✅ Evidências de funcionamento
 
-Para desenvolvimento, dá para trocar o DynamoDB da AWS pelo **DynamoDB Local** com um arquivo extra. Na apresentação use só o `docker-compose.yml`. No `.env`, coloque qualquer valor em `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY` e rode:
+Prints da execução (pasta `docs/prints/`).
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dynamo-local.yml up -d --build
-```
+**Todos os serviços no ar** (`docker compose ps`):
 
-## ✅ Roteiro de demonstração (evidências)
+![docker compose ps](docs/prints/compose-ps.png)
+
+**Aplicação (bilheteria):**
+
+![Aplicação](docs/prints/app.png)
+
+**Compra de ingresso:**
+
+![Compra](docs/prints/compra.png)
+
+**PostgreSQL** persistindo o ingresso comprado:
+
+![Postgres](docs/prints/postgres.png)
+
+**MinIO**: arquivos gravados (`posters/`, `thumbs/`, `ingressos/`) e PDF do ingresso gerado:
+
+![MinIO - bucket](docs/prints/minio1.png)
+
+![MinIO - PDF do ingresso](docs/prints/minio2.png)
+
+**RabbitMQ**, fila `cinematix-tarefas`:
+
+![RabbitMQ](docs/prints/rabbitmq.png)
+
+**Worker** consumindo a fila (`✓ thumbnail`, `✓ pdf`):
+
+![Logs do worker](docs/prints/worker-logs.png)
+
+**DynamoDB** (AWS): aba *Logs* do admin e tabela `dspn-projeto-dynamo-logs` no console da AWS:
+
+![DynamoDB](docs/prints/dynamo-logs.png)
+
+### Roteiro de demonstração
 
 | O que mostrar | Como |
 |---|---|
 | Todos os containers rodando | `docker compose ps` (todos `healthy` / `running`) |
 | Postgres persistindo | comprar um ingresso e rodar `docker compose exec postgres psql -U cinematix -d ingressos -c "select * from ingressos;"` |
-| MinIO: upload/download | cadastrar um filme com pôster no admin → arquivo aparece no console do MinIO (bucket `cinematix`) → pôster aparece na bilheteria; baixar o PDF do ingresso |
-| RabbitMQ: produção/consumo | painel do RabbitMQ (fila `cinematix-tarefas`, gráfico de mensagens) + `docker compose logs worker` mostrando `✓ thumbnail …` e `✓ pdf …` |
-| DynamoDB: escrita/consulta | aba **Logs** no admin (lê da tabela) ou console da AWS |
-
-<!-- Coloque aqui os prints: docs/prints/compose-ps.png, minio.png, rabbitmq.png, compra.png, logs-dynamo.png -->
+| MinIO: upload/download | cadastrar um filme com pôster no admin, ver o arquivo no console do MinIO (bucket `cinematix`) e baixar o PDF do ingresso |
+| RabbitMQ: produção/consumo | painel do RabbitMQ (fila `cinematix-tarefas`) e `docker compose logs worker` mostrando `✓ thumbnail …` e `✓ pdf …` |
+| DynamoDB: escrita/consulta | aba **Logs** no admin ou console da AWS |
 
 ---
 
@@ -363,7 +395,7 @@ Worker (launch templates/worker.sh):
 
 Injeta a URL do ALB na variável VITE_API_URL, compila os arquivos do React e sincroniza com o bucket S3.
 
-* Deploy do Backend na EC2:
+* Deploy do Backend :
   
   `./scripts/deploy-backend.sh <IP_DA_EC2>`
   
@@ -421,9 +453,9 @@ Conecta via SSH na instância, executa git pull, atualiza dependências do Pytho
 ```
 3. Rotas de acesso:
    
-  **Bilheteria Pública**: `http://localhost:5173/`
+  **Bilheteria Pública**: `http://<IP-DA-MAQUINA>:5173/`
    
-  **Painel Administrativo**: `http://localhost:5173/#/admin`
+  **Painel Administrativo**: `http://<IP-DA-MAQUINA>:5173/#/admin`
 
 # 🧪 Testes e Validações
 ## Teste de Fumaça (Smoke Test)

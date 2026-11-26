@@ -3,9 +3,10 @@
 name: cinematix
 
 x-aws: &aws
-  # DynamoDB continua na AWS: credenciais vêm do arquivo .env da raiz.
-  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?defina no .env}
-  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?defina no .env}
+  # DynamoDB continua na AWS. Na EC2 do AWS Academy deixe as chaves vazias no .env:
+  # o boto3 usa o instance profile (LabRole). Fora da AWS, preencha as chaves.
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
   AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
   AWS_REGION: ${AWS_REGION:-us-east-1}
   DYNAMO_TABLE: ${DYNAMO_TABLE:-dspn-projeto-dynamo-logs}
